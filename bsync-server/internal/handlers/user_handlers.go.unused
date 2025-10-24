@@ -1,0 +1,656 @@
+package handlers
+
+import (
+	"database/sql"
+	"fmt"
+	"net/http"
+	"strconv"
+
+	"bsync-server/internal/auth"
+	"bsync-server/internal/models"
+	"bsync-server/internal/repository"
+)
+
+// UserHandlers handles user-related HTTP requests
+type UserHandlers struct {
+	userRepo    *repository.UserRepository
+	authService *auth.AuthService
+}
+
+// NewUserHandlers creates a new user handlers
+func NewUserHandlers(userRepo *repository.UserRepository, authService *auth.AuthService) *UserHandlers {
+	return &UserHandlers{
+		userRepo:    userRepo,
+		authService: authService,
+	}
+}
+
+// Login handles user login
+// POST /api/v1/auth/login
+func (h *UserHandlers) Login(c *gin.Context) {
+	var req models.LoginRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "Invalid request format",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	response, err := h.authService.Login(req.Username, req.Password)
+	if err != nil {
+		// Log failed login attempt
+		_ = h.authService.LogActivity(
+			0,
+			req.Username,
+			models.ActionLoginFailed,
+			"",
+			"",
+			auth.GetClientIP(c),
+			c.GetHeader("User-Agent"),
+			gin.H{"reason": err.Error()},
+		)
+
+		statusCode := http.StatusUnauthorized
+		if err == auth.ErrUserNotActive {
+			statusCode = http.StatusForbidden
+		}
+
+		c.JSON(statusCode, gin.H{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	// Log successful login
+	_ = h.authService.LogActivity(
+		response.User.ID,
+		response.User.Username,
+		models.ActionLogin,
+		"",
+		"",
+		auth.GetClientIP(c),
+		c.GetHeader("User-Agent"),
+		nil,
+	)
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    response,
+	})
+}
+
+// Logout handles user logout
+// POST /api/v1/auth/logout
+func (h *UserHandlers) Logout(c *gin.Context) {
+	claims, _ := auth.GetCurrentUser(c)
+
+	// Log logout
+	if claims != nil {
+		_ = h.authService.LogActivity(
+			claims.UserID,
+			claims.Username,
+			models.ActionLogout,
+			"",
+			"",
+			auth.GetClientIP(c),
+			c.GetHeader("User-Agent"),
+			nil,
+		)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "Logged out successfully",
+	})
+}
+
+// GetMe returns current user info
+// GET /api/v1/auth/me
+func (h *UserHandlers) GetMe(c *gin.Context) {
+	claims, err := auth.GetCurrentUser(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"success": false,
+			"error":   "Unauthorized",
+		})
+		return
+	}
+
+	user, err := h.userRepo.GetUserWithAgents(claims.UserID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"success": false,
+			"error":   "User not found",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    user,
+	})
+}
+
+// ListUsers lists all users with filters
+// GET /api/v1/users
+func (h *UserHandlers) ListUsers(c *gin.Context) {
+	var filter models.UserListFilter
+	if err := c.ShouldBindQuery(&filter); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "Invalid query parameters",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	users, total, err := h.userRepo.ListUsers(filter)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"error":   "Failed to retrieve users",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    users,
+		"total":   total,
+		"page":    filter.Page,
+		"limit":   filter.Limit,
+	})
+}
+
+// GetUser retrieves a user by ID
+// GET /api/v1/users/:id
+func (h *UserHandlers) GetUser(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "Invalid user ID",
+		})
+		return
+	}
+
+	user, err := h.userRepo.GetUserWithAgents(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"success": false,
+			"error":   "User not found",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    user,
+	})
+}
+
+// CreateUser creates a new user
+// POST /api/v1/users
+func (h *UserHandlers) CreateUser(c *gin.Context) {
+	var req models.CreateUserRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "Invalid request format",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	// Get current user
+	currentUser, err := auth.GetCurrentUser(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"success": false,
+			"error":   "Unauthorized",
+		})
+		return
+	}
+
+	// Check if username already exists
+	if _, err := h.userRepo.GetUserByUsername(req.Username); err == nil {
+		c.JSON(http.StatusConflict, gin.H{
+			"success": false,
+			"error":   "Username already exists",
+		})
+		return
+	}
+
+	// Check if email already exists
+	if _, err := h.userRepo.GetUserByEmail(req.Email); err == nil {
+		c.JSON(http.StatusConflict, gin.H{
+			"success": false,
+			"error":   "Email already exists",
+		})
+		return
+	}
+
+	// Hash password
+	passwordHash, err := h.authService.HashPassword(req.Password)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	// Set default status if not provided
+	if req.Status == "" {
+		req.Status = models.StatusActive
+	}
+
+	// Create user
+	user := &models.User{
+		Username:     req.Username,
+		Email:        req.Email,
+		Fullname:     req.Fullname,
+		PasswordHash: passwordHash,
+		Role:         req.Role,
+		Status:       req.Status,
+		CreatedBy:    sql.NullInt64{Int64: int64(currentUser.UserID), Valid: true},
+	}
+
+	if err := h.userRepo.CreateUser(user); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"error":   "Failed to create user",
+		})
+		return
+	}
+
+	// Assign agents if provided (for operators)
+	if req.Role == models.RoleOperator && len(req.AssignedAgents) > 0 {
+		if err := h.userRepo.AssignAgentsToUser(user.ID, req.AssignedAgents, currentUser.UserID); err != nil {
+			// User created but agent assignment failed
+			c.JSON(http.StatusCreated, gin.H{
+				"success": true,
+				"data":    user,
+				"warning": "User created but agent assignment failed: " + err.Error(),
+			})
+			return
+		}
+	}
+
+	// Log activity
+	auth.LogActivityHelper(c, h.authService, models.ActionCreateUser, "user", strconv.Itoa(user.ID), gin.H{
+		"username": user.Username,
+		"role":     user.Role,
+	})
+
+	// Get user with agents
+	createdUser, _ := h.userRepo.GetUserWithAgents(user.ID)
+
+	c.JSON(http.StatusCreated, gin.H{
+		"success": true,
+		"data":    createdUser,
+		"message": "User created successfully",
+	})
+}
+
+// UpdateUser updates a user
+// PUT /api/v1/users/:id
+func (h *UserHandlers) UpdateUser(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "Invalid user ID",
+		})
+		return
+	}
+
+	var req models.UpdateUserRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "Invalid request format",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	// Get current user
+	currentUser, err := auth.GetCurrentUser(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"success": false,
+			"error":   "Unauthorized",
+		})
+		return
+	}
+
+	// Check if user exists
+	user, err := h.userRepo.GetUserByID(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"success": false,
+			"error":   "User not found",
+		})
+		return
+	}
+
+	// Build updates map
+	updates := make(map[string]interface{})
+
+	if req.Email != nil {
+		// Check if email already used by another user
+		if existingUser, err := h.userRepo.GetUserByEmail(*req.Email); err == nil && existingUser.ID != id {
+			c.JSON(http.StatusConflict, gin.H{
+				"success": false,
+				"error":   "Email already used by another user",
+			})
+			return
+		}
+		updates["email"] = *req.Email
+	}
+
+	if req.Fullname != nil {
+		updates["fullname"] = *req.Fullname
+	}
+
+	if req.Role != nil {
+		updates["role"] = *req.Role
+	}
+
+	if req.Status != nil {
+		updates["status"] = *req.Status
+	}
+
+	if req.Password != nil {
+		passwordHash, err := h.authService.HashPassword(*req.Password)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"success": false,
+				"error":   err.Error(),
+			})
+			return
+		}
+		updates["password_hash"] = passwordHash
+	}
+
+	// Update user if there are changes
+	if len(updates) > 0 {
+		if err := h.userRepo.UpdateUser(id, updates, currentUser.UserID); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"success": false,
+				"error":   "Failed to update user",
+			})
+			return
+		}
+	}
+
+	// Update agent assignments if provided
+	if req.AssignedAgents != nil {
+		newRole := user.Role
+		if req.Role != nil {
+			newRole = *req.Role
+		}
+
+		if newRole == models.RoleOperator {
+			if err := h.userRepo.AssignAgentsToUser(id, req.AssignedAgents, currentUser.UserID); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"success": false,
+					"error":   "Failed to update agent assignments",
+				})
+				return
+			}
+		}
+	}
+
+	// Log activity
+	auth.LogActivityHelper(c, h.authService, models.ActionUpdateUser, "user", strconv.Itoa(id), updates)
+
+	// Get updated user
+	updatedUser, _ := h.userRepo.GetUserWithAgents(id)
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    updatedUser,
+		"message": "User updated successfully",
+	})
+}
+
+// DeleteUser soft deletes a user
+// DELETE /api/v1/users/:id
+func (h *UserHandlers) DeleteUser(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "Invalid user ID",
+		})
+		return
+	}
+
+	// Get current user
+	currentUser, err := auth.GetCurrentUser(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"success": false,
+			"error":   "Unauthorized",
+		})
+		return
+	}
+
+	// Prevent self-deletion
+	if id == currentUser.UserID {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "Cannot delete your own account",
+		})
+		return
+	}
+
+	// Check if user exists
+	user, err := h.userRepo.GetUserByID(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"success": false,
+			"error":   "User not found",
+		})
+		return
+	}
+
+	// Delete user
+	if err := h.userRepo.SoftDeleteUser(id, currentUser.UserID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"error":   "Failed to delete user",
+		})
+		return
+	}
+
+	// Log activity
+	auth.LogActivityHelper(c, h.authService, models.ActionDeleteUser, "user", strconv.Itoa(id), gin.H{
+		"username": user.Username,
+	})
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": fmt.Sprintf("User '%s' deleted successfully", user.Username),
+	})
+}
+
+// ChangePassword changes user's password
+// POST /api/v1/users/change-password
+func (h *UserHandlers) ChangePassword(c *gin.Context) {
+	var req models.ChangePasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "Invalid request format",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	currentUser, err := auth.GetCurrentUser(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"success": false,
+			"error":   "Unauthorized",
+		})
+		return
+	}
+
+	if err := h.authService.ChangePassword(currentUser.UserID, req.OldPassword, req.NewPassword); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	// Log activity
+	auth.LogActivityHelper(c, h.authService, models.ActionChangePassword, "user", strconv.Itoa(currentUser.UserID), nil)
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "Password changed successfully",
+	})
+}
+
+// GetUserAgents gets agents assigned to a user
+// GET /api/v1/users/:id/agents
+func (h *UserHandlers) GetUserAgents(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "Invalid user ID",
+		})
+		return
+	}
+
+	agentIDs, err := h.userRepo.GetUserAgents(id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"error":   "Failed to retrieve user agents",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    agentIDs,
+	})
+}
+
+// AssignAgents assigns agents to a user
+// POST /api/v1/users/:id/agents
+func (h *UserHandlers) AssignAgents(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "Invalid user ID",
+		})
+		return
+	}
+
+	var req models.AssignAgentsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "Invalid request format",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	currentUser, err := auth.GetCurrentUser(c)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"success": false,
+			"error":   "Unauthorized",
+		})
+		return
+	}
+
+	// Check if user exists and is an operator
+	user, err := h.userRepo.GetUserByID(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"success": false,
+			"error":   "User not found",
+		})
+		return
+	}
+
+	if user.Role != models.RoleOperator {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "Can only assign agents to operators",
+		})
+		return
+	}
+
+	// Assign agents
+	if err := h.userRepo.AssignAgentsToUser(id, req.AgentIDs, currentUser.UserID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"error":   "Failed to assign agents",
+		})
+		return
+	}
+
+	// Log activity
+	auth.LogActivityHelper(c, h.authService, models.ActionAssignAgents, "user", strconv.Itoa(id), gin.H{
+		"agent_ids": req.AgentIDs,
+	})
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "Agents assigned successfully",
+	})
+}
+
+// RemoveAgentAssignment removes an agent assignment from a user
+// DELETE /api/v1/users/:id/agents/:agent_id
+func (h *UserHandlers) RemoveAgentAssignment(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "Invalid user ID",
+		})
+		return
+	}
+
+	agentID := c.Param("agent_id")
+	if agentID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "Agent ID is required",
+		})
+		return
+	}
+
+	if err := h.userRepo.RemoveAgentAssignment(id, agentID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"error":   "Failed to remove agent assignment",
+		})
+		return
+	}
+
+	// Log activity
+	auth.LogActivityHelper(c, h.authService, models.ActionUnassignAgent, "user", strconv.Itoa(id), gin.H{
+		"agent_id": agentID,
+	})
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "Agent assignment removed successfully",
+	})
+}

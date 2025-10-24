@@ -1,0 +1,250 @@
+package auth
+
+import (
+	"database/sql"
+	"net/http"
+	"strings"
+
+	"bsync-server/internal/models"
+	"bsync-server/internal/repository"
+
+	"github.com/gin-gonic/gin"
+)
+
+// AgentPermissionMiddleware creates middleware that checks agent access for operators
+type AgentPermissionMiddleware struct {
+	userRepo *repository.UserRepository
+}
+
+// NewAgentPermissionMiddleware creates a new agent permission middleware
+func NewAgentPermissionMiddleware(userRepo *repository.UserRepository) *AgentPermissionMiddleware {
+	return &AgentPermissionMiddleware{
+		userRepo: userRepo,
+	}
+}
+
+// CheckAgentAccess checks if the user has access to the agent specified in the request
+func (m *AgentPermissionMiddleware) CheckAgentAccess() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		claims, err := GetCurrentUser(c)
+		if err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"success": false,
+				"error":   "Unauthorized",
+			})
+			c.Abort()
+			return
+		}
+
+		// Admin has access to all agents
+		if claims.Role == models.RoleAdmin {
+			c.Next()
+			return
+		}
+
+		// For operators, check agent access
+		// Get agent_id from URL params or query
+		agentID := c.Param("agent_id")
+		if agentID == "" {
+			agentID = c.Query("agent_id")
+		}
+
+		if agentID == "" {
+			// If no specific agent in URL, allow (will be filtered in query)
+			c.Next()
+			return
+		}
+
+		// Check if operator has access to this agent
+		hasAccess, err := m.userRepo.HasAgentAccess(claims.UserID, agentID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"success": false,
+				"error":   "Failed to check agent access",
+			})
+			c.Abort()
+			return
+		}
+
+		if !hasAccess {
+			c.JSON(http.StatusForbidden, gin.H{
+				"success": false,
+				"error":   "Access denied: you don't have permission to access this agent",
+			})
+			c.Abort()
+			return
+		}
+
+		c.Next()
+	}
+}
+
+// CheckJobAgentAccess checks if user has access to both source and destination agents of a job
+func (m *AgentPermissionMiddleware) CheckJobAgentAccess(db *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		claims, err := GetCurrentUser(c)
+		if err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"success": false,
+				"error":   "Unauthorized",
+			})
+			c.Abort()
+			return
+		}
+
+		// Admin has access to all jobs
+		if claims.Role == models.RoleAdmin {
+			c.Next()
+			return
+		}
+
+		// For job creation/update, check agent IDs from request body
+		if c.Request.Method == "POST" || c.Request.Method == "PUT" {
+			var jobData struct {
+				SourceAgentID string `json:"source_agent_id"`
+				DestAgentID   string `json:"dest_agent_id"`
+			}
+
+			// We need to peek at the request body without consuming it
+			// Store the body in context for later use
+			bodyBytes, _ := c.GetRawData()
+			c.Set("raw_body", bodyBytes)
+
+			// Parse to check agents
+			if err := c.ShouldBindJSON(&jobData); err == nil {
+				// Check both source and destination agents
+				if jobData.SourceAgentID != "" {
+					hasAccess, _ := m.userRepo.HasAgentAccess(claims.UserID, jobData.SourceAgentID)
+					if !hasAccess {
+						c.JSON(http.StatusForbidden, gin.H{
+							"success": false,
+							"error":   "Access denied: you don't have permission to use source agent " + jobData.SourceAgentID,
+						})
+						c.Abort()
+						return
+					}
+				}
+
+				if jobData.DestAgentID != "" {
+					hasAccess, _ := m.userRepo.HasAgentAccess(claims.UserID, jobData.DestAgentID)
+					if !hasAccess {
+						c.JSON(http.StatusForbidden, gin.H{
+							"success": false,
+							"error":   "Access denied: you don't have permission to use destination agent " + jobData.DestAgentID,
+						})
+						c.Abort()
+						return
+					}
+				}
+			}
+		}
+
+		// For job retrieval/update/delete, check job_id from URL
+		jobID := c.Param("id")
+		if jobID != "" && (c.Request.Method == "GET" || c.Request.Method == "PUT" || c.Request.Method == "DELETE") {
+			// Query job to get its agents
+			query := `
+				SELECT source_agent_id, dest_agent_id
+				FROM sync_jobs
+				WHERE job_id = $1
+			`
+			var sourceAgentID, destAgentID string
+			err := db.QueryRow(query, jobID).Scan(&sourceAgentID, &destAgentID)
+			if err != nil {
+				if err == sql.ErrNoRows {
+					c.JSON(http.StatusNotFound, gin.H{
+						"success": false,
+						"error":   "Job not found",
+					})
+				} else {
+					c.JSON(http.StatusInternalServerError, gin.H{
+						"success": false,
+						"error":   "Failed to check job permissions",
+					})
+				}
+				c.Abort()
+				return
+			}
+
+			// Check if operator has access to at least one of the agents
+			hasSourceAccess, _ := m.userRepo.HasAgentAccess(claims.UserID, sourceAgentID)
+			hasDestAccess, _ := m.userRepo.HasAgentAccess(claims.UserID, destAgentID)
+
+			if !hasSourceAccess && !hasDestAccess {
+				c.JSON(http.StatusForbidden, gin.H{
+					"success": false,
+					"error":   "Access denied: you don't have permission to access this job",
+				})
+				c.Abort()
+				return
+			}
+		}
+
+		c.Next()
+	}
+}
+
+// FilterByUserAgents adds a WHERE clause filter for operator's assigned agents
+// This is a helper function to be used in query building
+func FilterByUserAgents(userID int, role string, userRepo *repository.UserRepository) (string, []interface{}, error) {
+	// Admin sees all
+	if role == models.RoleAdmin {
+		return "", nil, nil
+	}
+
+	// Get operator's assigned agents
+	agentIDs, err := userRepo.GetUserAgents(userID)
+	if err != nil {
+		return "", nil, err
+	}
+
+	if len(agentIDs) == 0 {
+		// Operator has no agents assigned - return impossible condition
+		return "1 = 0", nil, nil
+	}
+
+	// Build IN clause
+	placeholders := make([]string, len(agentIDs))
+	args := make([]interface{}, len(agentIDs))
+	for i, agentID := range agentIDs {
+		placeholders[i] = "$" + string(rune(i+1))
+		args[i] = agentID
+	}
+
+	whereClause := "(source_agent_id IN (" + strings.Join(placeholders, ",") + ") OR dest_agent_id IN (" + strings.Join(placeholders, ",") + "))"
+	return whereClause, args, nil
+}
+
+// GetUserAccessibleAgents returns list of agent IDs accessible by user
+func GetUserAccessibleAgents(claims *models.JWTClaims) []string {
+	// Use agents from JWT claims (already populated during login)
+	return claims.AssignedAgents
+}
+
+// HasAccessToAgent checks if user has access to a specific agent
+func HasAccessToAgent(claims *models.JWTClaims, agentID string) bool {
+	// Admin has access to all
+	if claims.Role == models.RoleAdmin {
+		return true
+	}
+
+	// Check if agent is in user's assigned agents
+	for _, assignedAgent := range claims.AssignedAgents {
+		if assignedAgent == agentID {
+			return true
+		}
+	}
+
+	return false
+}
+
+// HasAccessToJob checks if user has access to a job (either source or dest agent)
+func HasAccessToJob(claims *models.JWTClaims, sourceAgentID, destAgentID string) bool {
+	// Admin has access to all
+	if claims.Role == models.RoleAdmin {
+		return true
+	}
+
+	// Operator needs access to at least one agent
+	return HasAccessToAgent(claims, sourceAgentID) || HasAccessToAgent(claims, destAgentID)
+}

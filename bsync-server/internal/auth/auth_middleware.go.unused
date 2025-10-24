@@ -1,0 +1,276 @@
+package auth
+
+import (
+	"database/sql"
+	"net/http"
+	"strings"
+
+	"bsync-server/internal/models"
+)
+
+// ContextKey is the key for storing user info in context
+const (
+	ContextKeyUser   = "user"
+	ContextKeyClaims = "claims"
+)
+
+// AuthMiddleware creates a middleware that validates JWT tokens
+func AuthMiddleware(authService *AuthService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Get token from Authorization header
+		authHeader := c.GetHeader("Authorization")
+		if authHeader == "" {
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"success": false,
+				"error":   "Authorization header required",
+			})
+			c.Abort()
+			return
+		}
+
+		// Check if it's a Bearer token
+		parts := strings.SplitN(authHeader, " ", 2)
+		if len(parts) != 2 || parts[0] != "Bearer" {
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"success": false,
+				"error":   "Invalid authorization header format. Use: Bearer <token>",
+			})
+			c.Abort()
+			return
+		}
+
+		tokenString := parts[1]
+
+		// Validate token
+		claims, err := authService.ValidateToken(tokenString)
+		if err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"success": false,
+				"error":   "Invalid or expired token",
+			})
+			c.Abort()
+			return
+		}
+
+		// Store claims in context
+		c.Set(ContextKeyClaims, claims)
+		c.Next()
+	}
+}
+
+// RoleMiddleware creates a middleware that checks user role
+func RoleMiddleware(allowedRoles ...string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		claims, exists := c.Get(ContextKeyClaims)
+		if !exists {
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"success": false,
+				"error":   "Unauthorized",
+			})
+			c.Abort()
+			return
+		}
+
+		jwtClaims, ok := claims.(*models.JWTClaims)
+		if !ok {
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"success": false,
+				"error":   "Invalid token claims",
+			})
+			c.Abort()
+			return
+		}
+
+		// Check if user's role is in allowed roles
+		roleAllowed := false
+		for _, role := range allowedRoles {
+			if jwtClaims.Role == role {
+				roleAllowed = true
+				break
+			}
+		}
+
+		if !roleAllowed {
+			c.JSON(http.StatusForbidden, gin.H{
+				"success": false,
+				"error":   "Access denied: insufficient permissions",
+			})
+			c.Abort()
+			return
+		}
+
+		c.Next()
+	}
+}
+
+// AdminOnly middleware - only allows admin users
+func AdminOnly() gin.HandlerFunc {
+	return RoleMiddleware(models.RoleAdmin)
+}
+
+// GetCurrentUser retrieves current user claims from context
+func GetCurrentUser(c *gin.Context) (*models.JWTClaims, error) {
+	claims, exists := c.Get(ContextKeyClaims)
+	if !exists {
+		return nil, ErrInvalidToken
+	}
+
+	jwtClaims, ok := claims.(*models.JWTClaims)
+	if !ok {
+		return nil, ErrInvalidToken
+	}
+
+	return jwtClaims, nil
+}
+
+// GetUserID retrieves current user ID from context
+func GetUserID(c *gin.Context) (int, error) {
+	claims, err := GetCurrentUser(c)
+	if err != nil {
+		return 0, err
+	}
+	return claims.UserID, nil
+}
+
+// IsAdmin checks if current user is admin
+func IsAdmin(c *gin.Context) bool {
+	claims, err := GetCurrentUser(c)
+	if err != nil {
+		return false
+	}
+	return claims.Role == models.RoleAdmin
+}
+
+// GetClientIP gets the real client IP address
+func GetClientIP(c *gin.Context) string {
+	// Try to get from X-Forwarded-For first
+	ip := c.GetHeader("X-Forwarded-For")
+	if ip != "" {
+		// X-Forwarded-For can contain multiple IPs, get the first one
+		parts := strings.Split(ip, ",")
+		return strings.TrimSpace(parts[0])
+	}
+
+	// Try X-Real-IP
+	ip = c.GetHeader("X-Real-IP")
+	if ip != "" {
+		return ip
+	}
+
+	// Fall back to RemoteAddr
+	return c.ClientIP()
+}
+
+// ActivityLogMiddleware logs user activities
+func ActivityLogMiddleware(authService *AuthService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Skip logging for certain paths (health checks, etc.)
+		if strings.HasPrefix(c.Request.URL.Path, "/health") ||
+			strings.HasPrefix(c.Request.URL.Path, "/metrics") {
+			c.Next()
+			return
+		}
+
+		claims, exists := c.Get(ContextKeyClaims)
+		if !exists {
+			c.Next()
+			return
+		}
+
+		jwtClaims, ok := claims.(*models.JWTClaims)
+		if !ok {
+			c.Next()
+			return
+		}
+
+		// Determine action based on method and path
+		action := determineAction(c.Request.Method, c.Request.URL.Path)
+		if action == "" {
+			c.Next()
+			return
+		}
+
+		// Get resource info
+		resourceType, resourceID := extractResourceInfo(c)
+
+		// Log activity after request completes
+		c.Next()
+
+		// Only log successful operations (2xx status codes)
+		if c.Writer.Status() >= 200 && c.Writer.Status() < 300 {
+			_ = authService.LogActivity(
+				jwtClaims.UserID,
+				jwtClaims.Username,
+				action,
+				resourceType,
+				resourceID,
+				GetClientIP(c),
+				c.GetHeader("User-Agent"),
+				nil,
+			)
+		}
+	}
+}
+
+// determineAction determines the action based on HTTP method and path
+func determineAction(method, path string) string {
+	// Map HTTP methods to actions
+	switch {
+	case strings.Contains(path, "/auth/login"):
+		return models.ActionLogin
+	case strings.Contains(path, "/auth/logout"):
+		return models.ActionLogout
+	case strings.Contains(path, "/users") && method == "POST":
+		return models.ActionCreateUser
+	case strings.Contains(path, "/users") && method == "PUT":
+		return models.ActionUpdateUser
+	case strings.Contains(path, "/users") && method == "DELETE":
+		return models.ActionDeleteUser
+	case strings.Contains(path, "/agents") && method == "POST":
+		return models.ActionAssignAgents
+	case strings.Contains(path, "/sync-jobs") && method == "POST":
+		return models.ActionCreateJob
+	case strings.Contains(path, "/sync-jobs") && method == "PUT":
+		return models.ActionUpdateJob
+	case strings.Contains(path, "/sync-jobs") && method == "DELETE":
+		return models.ActionDeleteJob
+	}
+	return ""
+}
+
+// extractResourceInfo extracts resource type and ID from request
+func extractResourceInfo(c *gin.Context) (string, string) {
+	path := c.Request.URL.Path
+
+	switch {
+	case strings.Contains(path, "/users"):
+		return "user", c.Param("id")
+	case strings.Contains(path, "/sync-jobs"):
+		return "job", c.Param("id")
+	case strings.Contains(path, "/agents"):
+		return "agent", c.Param("id")
+	}
+
+	return "", ""
+}
+
+// LogActivityHelper is a helper function to manually log activity
+func LogActivityHelper(c *gin.Context, authService *AuthService, action, resourceType, resourceID string, details interface{}) {
+	claims, err := GetCurrentUser(c)
+	if err != nil {
+		return
+	}
+
+	log := &models.UserActivityLog{
+		UserID:       sql.NullInt64{Int64: int64(claims.UserID), Valid: true},
+		Username:     claims.Username,
+		Action:       action,
+		ResourceType: sql.NullString{String: resourceType, Valid: resourceType != ""},
+		ResourceID:   sql.NullString{String: resourceID, Valid: resourceID != ""},
+		IPAddress:    sql.NullString{String: GetClientIP(c), Valid: true},
+		UserAgent:    sql.NullString{String: c.GetHeader("User-Agent"), Valid: true},
+		Details:      details,
+	}
+
+	_ = authService.userRepo.LogActivity(log)
+}
